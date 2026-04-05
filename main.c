@@ -16,6 +16,8 @@
 #include "ptedit.h"
 
 extern void spec_ret_gadget(void *ptr);
+extern void spec_ret_gadget_burst(void *ptr);
+extern void spec_ret_store_gadget(void *ptr);
 extern long time_memory_load(void *ptr);
 
 #define PAGE_SIZE 4096
@@ -35,9 +37,20 @@ typedef enum {
 } access_mode_t;
 
 typedef enum {
+    GADGET_LOAD,
+    GADGET_LOAD_BURST,
+    GADGET_STORE_THEN_LOAD,
+} gadget_mode_t;
+
+typedef enum {
     CACHE_PRIVATE,
     CACHE_LLC,
 } cache_mode_t;
+
+typedef enum {
+    PROBE_FORKED,
+    PROBE_SAME_THREAD,
+} probe_mode_t;
 
 typedef struct {
     sem_t trial_ready;
@@ -49,7 +62,9 @@ typedef struct {
     int slots;
     int num_trials;
     access_mode_t access_mode;
+    gadget_mode_t gadget_mode;
     cache_mode_t cache_mode;
+    probe_mode_t probe_mode;
     int flush_stack_ptes;
     int parent_cpu;
     int child_cpu;
@@ -65,8 +80,25 @@ static const char *access_mode_name(access_mode_t mode) {
     return mode == ACCESS_TRANSIENT ? "transient" : "non-transient";
 }
 
+static const char *gadget_mode_name(gadget_mode_t mode) {
+    switch (mode) {
+    case GADGET_LOAD:
+        return "load";
+    case GADGET_LOAD_BURST:
+        return "load-burst";
+    case GADGET_STORE_THEN_LOAD:
+        return "store-then-load";
+    }
+
+    return "unknown";
+}
+
 static const char *cache_mode_name(cache_mode_t mode) {
     return mode == CACHE_PRIVATE ? "private" : "llc";
+}
+
+static const char *probe_mode_name(probe_mode_t mode) {
+    return mode == PROBE_SAME_THREAD ? "same-thread" : "forked";
 }
 
 static void usage(const char *argv0) {
@@ -74,6 +106,8 @@ static void usage(const char *argv0) {
             "usage: %s --slots N --trials N --access <n|non-transient|t|transient> "
             "--cache <private|llc> [options]\n",
             argv0);
+    fprintf(stderr, "  --gadget <load|load-burst|store-then-load> transient gadget variant\n");
+    fprintf(stderr, "  --probe <forked|same-thread> probe from child process or current thread\n");
     fprintf(stderr, "  --parent-cpu N         override parent CPU affinity\n");
     fprintf(stderr, "  --child-cpu N          override child CPU affinity\n");
     fprintf(stderr, "  --flush-stack-ptes     flush stack page-table entries before transient access\n");
@@ -148,7 +182,17 @@ static void execute_access(const experiment_config_t *config, void *ptr) {
     }
 
     if (config->access_mode == ACCESS_TRANSIENT) {
-        spec_ret_gadget(ptr);
+        switch (config->gadget_mode) {
+        case GADGET_LOAD:
+            spec_ret_gadget(ptr);
+            break;
+        case GADGET_LOAD_BURST:
+            spec_ret_gadget_burst(ptr);
+            break;
+        case GADGET_STORE_THEN_LOAD:
+            spec_ret_store_gadget(ptr);
+            break;
+        }
         return;
     }
 
@@ -167,9 +211,11 @@ static void record_probe_result(probe_stats_t *stats, int expected, int found) {
 
 static void print_summary(const experiment_config_t *config, const probe_stats_t *stats) {
     printf(
-        "%s %s: hits %d/%d (%.1f%%) unknown %d/%d (%.1f%%) incorrect %d/%d (%.1f%%)\n",
+        "%s %s %s %s: hits %d/%d (%.1f%%) unknown %d/%d (%.1f%%) incorrect %d/%d (%.1f%%)\n",
         cache_mode_name(config->cache_mode),
         access_mode_name(config->access_mode),
+        gadget_mode_name(config->gadget_mode),
+        probe_mode_name(config->probe_mode),
         stats->hits,
         config->num_trials,
         100.0 * stats->hits / config->num_trials,
@@ -216,6 +262,33 @@ static void parent_process(const experiment_config_t *config, shared_t *shared, 
     }
 }
 
+static int probe_threshold(const experiment_config_t *config) {
+    return config->cache_mode == CACHE_LLC ? HIT_THRESHOLD_LLC : HIT_THRESHOLD_L1;
+}
+
+static void run_same_thread_experiment(const experiment_config_t *config, void *buf) {
+    size_t buf_size = (size_t)config->slots * PAGE_SIZE;
+    probe_stats_t stats = {0};
+
+    if (pin_to_cpu(config->parent_cpu) != 0) {
+        perror("sched_setaffinity parent");
+        exit(1);
+    }
+
+    for (int t = 0; t < config->num_trials; t++) {
+        int target = rand() % config->slots;
+        char *ptr = (char *)buf + target * PAGE_SIZE;
+        int found;
+
+        execute_access(config, ptr);
+        found = probe(buf, config->slots, probe_threshold(config));
+        record_probe_result(&stats, target, found);
+        flush_from_cache(buf, buf_size);
+    }
+
+    print_summary(config, &stats);
+}
+
 static void run_experiment(const experiment_config_t *config, void *buf) {
     size_t buf_size = (size_t)config->slots * PAGE_SIZE;
     shared_t *shared = mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
@@ -233,15 +306,23 @@ static void run_experiment(const experiment_config_t *config, void *buf) {
     }
 
     flush_from_cache(buf, buf_size);
-    printf("cache mode %s, access mode %s, parent cpu %d, child cpu %d\n",
+    printf("cache mode %s, access mode %s, gadget %s, probe mode %s, parent cpu %d, child cpu %d\n",
            cache_mode_name(config->cache_mode),
            access_mode_name(config->access_mode),
+           gadget_mode_name(config->gadget_mode),
+           probe_mode_name(config->probe_mode),
            config->parent_cpu,
            config->child_cpu);
     if (config->flush_stack_ptes) {
         printf("transient stack PTE flushing enabled\n");
     }
     fflush(stdout);
+
+    if (config->probe_mode == PROBE_SAME_THREAD) {
+        run_same_thread_experiment(config, buf);
+        munmap(shared, sizeof(*shared));
+        return;
+    }
 
     pid = fork();
     if (pid < 0) {
@@ -278,6 +359,22 @@ static access_mode_t parse_access_mode(const char *arg) {
     exit(1);
 }
 
+static gadget_mode_t parse_gadget_mode(const char *arg) {
+    if (strcmp(arg, "load") == 0) {
+        return GADGET_LOAD;
+    }
+    if (strcmp(arg, "load-burst") == 0) {
+        return GADGET_LOAD_BURST;
+    }
+    if (strcmp(arg, "store-then-load") == 0) {
+        return GADGET_STORE_THEN_LOAD;
+    }
+
+    fprintf(stderr, "invalid gadget mode: %s\n", arg);
+    usage("main");
+    exit(1);
+}
+
 static cache_mode_t parse_cache_mode(const char *arg) {
     if (strcmp(arg, "private") == 0) {
         return CACHE_PRIVATE;
@@ -287,6 +384,19 @@ static cache_mode_t parse_cache_mode(const char *arg) {
     }
 
     fprintf(stderr, "invalid cache mode: %s\n", arg);
+    usage("main");
+    exit(1);
+}
+
+static probe_mode_t parse_probe_mode(const char *arg) {
+    if (strcmp(arg, "forked") == 0) {
+        return PROBE_FORKED;
+    }
+    if (strcmp(arg, "same-thread") == 0) {
+        return PROBE_SAME_THREAD;
+    }
+
+    fprintf(stderr, "invalid probe mode: %s\n", arg);
     usage("main");
     exit(1);
 }
@@ -321,6 +431,7 @@ static experiment_config_t parse_config(int argc, char **argv) {
     int have_slots = 0;
     int have_trials = 0;
     int have_access = 0;
+    int have_gadget = 0;
     int have_cache = 0;
     int have_parent_cpu = 0;
     int have_child_cpu = 0;
@@ -330,7 +441,9 @@ static experiment_config_t parse_config(int argc, char **argv) {
         {"slots", required_argument, NULL, 's'},
         {"trials", required_argument, NULL, 'n'},
         {"access", required_argument, NULL, 'a'},
+        {"gadget", required_argument, NULL, 'g'},
         {"cache", required_argument, NULL, 'c'},
+        {"probe", required_argument, NULL, 'r'},
         {"parent-cpu", required_argument, NULL, 'p'},
         {"child-cpu", required_argument, NULL, 'q'},
         {"flush-stack-ptes", no_argument, NULL, 'f'},
@@ -340,9 +453,11 @@ static experiment_config_t parse_config(int argc, char **argv) {
 
     memset(&config, 0, sizeof(config));
     config.flush_stack_ptes = 0;
+    config.probe_mode = PROBE_FORKED;
+    config.gadget_mode = GADGET_LOAD;
     opterr = 0;
 
-    while ((opt = getopt_long(argc, argv, "s:n:a:c:p:q:fh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "s:n:a:g:c:r:p:q:fh", long_options, &option_index)) != -1) {
         switch (opt) {
         case 's':
             if (parse_required_int("slots", optarg, &config.slots, 0) != 0) {
@@ -360,9 +475,16 @@ static experiment_config_t parse_config(int argc, char **argv) {
             config.access_mode = parse_access_mode(optarg);
             have_access = 1;
             break;
+        case 'g':
+            config.gadget_mode = parse_gadget_mode(optarg);
+            have_gadget = 1;
+            break;
         case 'c':
             config.cache_mode = parse_cache_mode(optarg);
             have_cache = 1;
+            break;
+        case 'r':
+            config.probe_mode = parse_probe_mode(optarg);
             break;
         case 'p':
             if (parse_required_int("parent_cpu", optarg, &config.parent_cpu, 1) != 0) {
@@ -417,6 +539,19 @@ static experiment_config_t parse_config(int argc, char **argv) {
 
     if (config.cache_mode == CACHE_PRIVATE && config.parent_cpu != config.child_cpu) {
         fprintf(stderr, "private mode requires the same parent and child CPU\n");
+        exit(1);
+    }
+    if (config.probe_mode == PROBE_SAME_THREAD) {
+        config.child_cpu = config.parent_cpu;
+    } else if (config.cache_mode == CACHE_PRIVATE && !have_child_cpu) {
+        config.child_cpu = config.parent_cpu;
+    }
+    if (config.cache_mode == CACHE_LLC && config.probe_mode == PROBE_SAME_THREAD) {
+        fprintf(stderr, "llc cache mode requires --probe forked\n");
+        exit(1);
+    }
+    if (config.access_mode == ACCESS_NON_TRANSIENT && have_gadget) {
+        fprintf(stderr, "--gadget only applies to transient mode\n");
         exit(1);
     }
     if (config.flush_stack_ptes && config.access_mode != ACCESS_TRANSIENT) {

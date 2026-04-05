@@ -52,7 +52,7 @@ spec_ret_store_gadget:
 store_level_a:
     call store_mispredict_return
     mov qword [rdi], 42
-    mov rax, qword [rdi]
+    ; mov rax, qword [rdi]
 store_mispredict_return:
     pop rax
     clflush [rsp]

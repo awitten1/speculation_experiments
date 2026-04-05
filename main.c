@@ -87,7 +87,7 @@ static const char *gadget_mode_name(gadget_mode_t mode) {
     case GADGET_LOAD_BURST:
         return "load-burst";
     case GADGET_STORE_THEN_LOAD:
-        return "store-then-load";
+        return "store";
     }
 
     return "unknown";
@@ -106,7 +106,7 @@ static void usage(const char *argv0) {
             "usage: %s --slots N --trials N --access <n|non-transient|t|transient> "
             "--cache <private|llc> [options]\n",
             argv0);
-    fprintf(stderr, "  --gadget <load|load-burst|store-then-load> transient gadget variant\n");
+    fprintf(stderr, "  --gadget <load|load-burst|store> transient gadget variant\n");
     fprintf(stderr, "  --probe <forked|same-thread> probe from child process or current thread\n");
     fprintf(stderr, "  --parent-cpu N         override parent CPU affinity\n");
     fprintf(stderr, "  --child-cpu N          override child CPU affinity\n");
@@ -366,7 +366,7 @@ static gadget_mode_t parse_gadget_mode(const char *arg) {
     if (strcmp(arg, "load-burst") == 0) {
         return GADGET_LOAD_BURST;
     }
-    if (strcmp(arg, "store-then-load") == 0) {
+    if (strcmp(arg, "store") == 0) {
         return GADGET_STORE_THEN_LOAD;
     }
 

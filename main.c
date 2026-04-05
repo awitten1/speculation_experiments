@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 
+#include <getopt.h>
 #include <limits.h>
-#include <errno.h>
 #include <semaphore.h>
 #include <sched.h>
 #include <stddef.h>
@@ -13,6 +13,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "ptedit.h"
+
 extern void spec_ret_gadget(void *ptr);
 extern long time_memory_load(void *ptr);
 
@@ -23,6 +25,9 @@ extern long time_memory_load(void *ptr);
 #define DEFAULT_PRIVATE_CPU 0
 #define DEFAULT_LLC_PARENT_CPU 0
 #define DEFAULT_LLC_CHILD_CPU 2
+#define STACK_PTE_FLUSH_LEVELS \
+    (PTEDIT_FLUSH_LEVEL_PGD | PTEDIT_FLUSH_LEVEL_P4D | PTEDIT_FLUSH_LEVEL_PUD | \
+     PTEDIT_FLUSH_LEVEL_PMD | PTEDIT_FLUSH_LEVEL_PTE)
 
 typedef enum {
     ACCESS_NON_TRANSIENT,
@@ -45,6 +50,7 @@ typedef struct {
     int num_trials;
     access_mode_t access_mode;
     cache_mode_t cache_mode;
+    int flush_stack_ptes;
     int parent_cpu;
     int child_cpu;
 } experiment_config_t;
@@ -65,10 +71,15 @@ static const char *cache_mode_name(cache_mode_t mode) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s <slots> <trials> <n|t> <private|llc> [parent_cpu [child_cpu]]\n",
+            "usage: %s --slots N --trials N --access <n|non-transient|t|transient> "
+            "--cache <private|llc> [options]\n",
             argv0);
-    fprintf(stderr, "  private mode defaults to parent_cpu=child_cpu=%d\n", DEFAULT_PRIVATE_CPU);
-    fprintf(stderr, "  llc mode defaults to parent_cpu=%d child_cpu=%d\n",
+    fprintf(stderr, "  --parent-cpu N         override parent CPU affinity\n");
+    fprintf(stderr, "  --child-cpu N          override child CPU affinity\n");
+    fprintf(stderr, "  --flush-stack-ptes     flush stack page-table entries before transient access\n");
+    fprintf(stderr, "  --help                 show this message\n");
+    fprintf(stderr, "  private defaults to parent_cpu=child_cpu=%d\n", DEFAULT_PRIVATE_CPU);
+    fprintf(stderr, "  llc defaults to parent_cpu=%d child_cpu=%d\n",
             DEFAULT_LLC_PARENT_CPU, DEFAULT_LLC_CHILD_CPU);
 }
 
@@ -122,8 +133,21 @@ static int probe(void *buf, int num_slots, int threshold) {
     return found;
 }
 
-static void execute_access(access_mode_t mode, void *ptr) {
-    if (mode == ACCESS_TRANSIENT) {
+static void flush_stack_ptes(void) {
+    volatile char stack_marker = 0;
+
+    if (ptedit_flush_address_cache((void *)&stack_marker, 0, STACK_PTE_FLUSH_LEVELS, 0) != 0) {
+        fprintf(stderr, "ptedit_flush_address_cache failed for stack address\n");
+        exit(1);
+    }
+}
+
+static void execute_access(const experiment_config_t *config, void *ptr) {
+    if (config->flush_stack_ptes) {
+        flush_stack_ptes();
+    }
+
+    if (config->access_mode == ACCESS_TRANSIENT) {
         spec_ret_gadget(ptr);
         return;
     }
@@ -186,7 +210,7 @@ static void parent_process(const experiment_config_t *config, shared_t *shared, 
         shared->target = rand() % config->slots;
         ptr = (char *)buf + shared->target * PAGE_SIZE;
 
-        execute_access(config->access_mode, ptr);
+        execute_access(config, ptr);
         sem_post(&shared->trial_ready);
         sem_wait(&shared->probe_done);
     }
@@ -214,6 +238,9 @@ static void run_experiment(const experiment_config_t *config, void *buf) {
            access_mode_name(config->access_mode),
            config->parent_cpu,
            config->child_cpu);
+    if (config->flush_stack_ptes) {
+        printf("transient stack PTE flushing enabled\n");
+    }
     fflush(stdout);
 
     pid = fork();
@@ -239,10 +266,10 @@ static void run_experiment(const experiment_config_t *config, void *buf) {
 }
 
 static access_mode_t parse_access_mode(const char *arg) {
-    if (strcmp(arg, "t") == 0) {
+    if (strcmp(arg, "t") == 0 || strcmp(arg, "transient") == 0) {
         return ACCESS_TRANSIENT;
     }
-    if (strcmp(arg, "n") == 0) {
+    if (strcmp(arg, "n") == 0 || strcmp(arg, "non-transient") == 0) {
         return ACCESS_NON_TRANSIENT;
     }
 
@@ -275,51 +302,126 @@ static void initialize_cpu_defaults(experiment_config_t *config) {
     config->child_cpu = DEFAULT_LLC_CHILD_CPU;
 }
 
-static void parse_positive_int_arg(const char *name, const char *arg, int *value) {
+static int parse_required_int(const char *name, const char *arg, int *value, int allow_zero) {
     char *end = NULL;
     long parsed = strtol(arg, &end, 10);
 
-    if (end == arg || *end != '\0' || parsed <= 0 || parsed > INT_MAX) {
+    if (end == arg || *end != '\0' || parsed > INT_MAX || (!allow_zero && parsed <= 0) ||
+        (allow_zero && parsed < 0)) {
         fprintf(stderr, "invalid %s: %s\n", name, arg);
-        exit(1);
+        return -1;
     }
 
     *value = (int)parsed;
-}
-
-static void parse_cpu_arg(const char *name, const char *arg, int *value) {
-    char *end = NULL;
-    long parsed = strtol(arg, &end, 10);
-
-    if (end == arg || *end != '\0' || parsed < 0 || parsed > INT_MAX) {
-        fprintf(stderr, "invalid %s: %s\n", name, arg);
-        exit(1);
-    }
-
-    *value = (int)parsed;
+    return 0;
 }
 
 static experiment_config_t parse_config(int argc, char **argv) {
     experiment_config_t config;
+    int have_slots = 0;
+    int have_trials = 0;
+    int have_access = 0;
+    int have_cache = 0;
+    int have_parent_cpu = 0;
+    int have_child_cpu = 0;
+    int option_index = 0;
+    int opt;
+    static const struct option long_options[] = {
+        {"slots", required_argument, NULL, 's'},
+        {"trials", required_argument, NULL, 'n'},
+        {"access", required_argument, NULL, 'a'},
+        {"cache", required_argument, NULL, 'c'},
+        {"parent-cpu", required_argument, NULL, 'p'},
+        {"child-cpu", required_argument, NULL, 'q'},
+        {"flush-stack-ptes", no_argument, NULL, 'f'},
+        {"help", no_argument, NULL, 'h'},
+        {0, 0, 0, 0},
+    };
 
-    if (argc < 5 || argc > 7) {
+    memset(&config, 0, sizeof(config));
+    config.flush_stack_ptes = 0;
+    opterr = 0;
+
+    while ((opt = getopt_long(argc, argv, "s:n:a:c:p:q:fh", long_options, &option_index)) != -1) {
+        switch (opt) {
+        case 's':
+            if (parse_required_int("slots", optarg, &config.slots, 0) != 0) {
+                exit(1);
+            }
+            have_slots = 1;
+            break;
+        case 'n':
+            if (parse_required_int("trials", optarg, &config.num_trials, 0) != 0) {
+                exit(1);
+            }
+            have_trials = 1;
+            break;
+        case 'a':
+            config.access_mode = parse_access_mode(optarg);
+            have_access = 1;
+            break;
+        case 'c':
+            config.cache_mode = parse_cache_mode(optarg);
+            have_cache = 1;
+            break;
+        case 'p':
+            if (parse_required_int("parent_cpu", optarg, &config.parent_cpu, 1) != 0) {
+                exit(1);
+            }
+            have_parent_cpu = 1;
+            break;
+        case 'q':
+            if (parse_required_int("child_cpu", optarg, &config.child_cpu, 1) != 0) {
+                exit(1);
+            }
+            have_child_cpu = 1;
+            break;
+        case 'f':
+            config.flush_stack_ptes = 1;
+            break;
+        case 'h':
+            usage(argv[0]);
+            exit(0);
+        default:
+            usage(argv[0]);
+            exit(1);
+        }
+    }
+
+    if (optind != argc) {
+        fprintf(stderr, "unexpected positional argument: %s\n", argv[optind]);
+        usage(argv[0]);
+        exit(1);
+    }
+    if (!have_slots || !have_trials || !have_access || !have_cache) {
         usage(argv[0]);
         exit(1);
     }
 
-    parse_positive_int_arg("slots", argv[1], &config.slots);
-    parse_positive_int_arg("trials", argv[2], &config.num_trials);
-    config.access_mode = parse_access_mode(argv[3]);
-    config.cache_mode = parse_cache_mode(argv[4]);
-    initialize_cpu_defaults(&config);
-
-    if (argc >= 6) {
-        parse_cpu_arg("parent_cpu", argv[5], &config.parent_cpu);
+    if (!have_parent_cpu && !have_child_cpu) {
+        initialize_cpu_defaults(&config);
+    } else if (config.cache_mode == CACHE_PRIVATE) {
+        if (!have_parent_cpu && have_child_cpu) {
+            config.parent_cpu = config.child_cpu;
+        } else if (have_parent_cpu && !have_child_cpu) {
+            config.child_cpu = config.parent_cpu;
+        }
+    } else {
+        if (!have_parent_cpu) {
+            config.parent_cpu = DEFAULT_LLC_PARENT_CPU;
+        }
+        if (!have_child_cpu) {
+            config.child_cpu = DEFAULT_LLC_CHILD_CPU;
+        }
     }
-    if (argc >= 7) {
-        parse_cpu_arg("child_cpu", argv[6], &config.child_cpu);
-    } else if (argc == 6 && config.cache_mode == CACHE_PRIVATE) {
-        config.child_cpu = config.parent_cpu;
+
+    if (config.cache_mode == CACHE_PRIVATE && config.parent_cpu != config.child_cpu) {
+        fprintf(stderr, "private mode requires the same parent and child CPU\n");
+        exit(1);
+    }
+    if (config.flush_stack_ptes && config.access_mode != ACCESS_TRANSIENT) {
+        fprintf(stderr, "flush-stack-ptes requires transient mode\n");
+        exit(1);
     }
 
     return config;
@@ -340,7 +442,16 @@ int main(int argc, char **argv) {
     }
     memset(buf, 0, buf_size);
 
+    if (config.flush_stack_ptes && ptedit_init() != 0) {
+        fprintf(stderr, "ptedit_init failed; is the PTEditor module loaded?\n");
+        munmap(buf, buf_size);
+        return 1;
+    }
+
     run_experiment(&config, buf);
+    if (config.flush_stack_ptes) {
+        ptedit_cleanup();
+    }
     munmap(buf, buf_size);
     return 0;
 }

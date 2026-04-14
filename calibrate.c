@@ -11,6 +11,16 @@
 #include <unistd.h>
 
 extern long time_memory_load(void *ptr);
+extern long time_memory_load_rdpru(void *ptr);
+extern long time_memory_load_rdpru_aperf(void *ptr);
+
+#ifdef USE_RDPRU_APERF
+#define TIME_LOAD(ptr) time_memory_load_rdpru_aperf(ptr)
+#elif defined(USE_RDPRU)
+#define TIME_LOAD(ptr) time_memory_load_rdpru(ptr)
+#else
+#define TIME_LOAD(ptr) time_memory_load(ptr)
+#endif
 
 #define CACHE_LINE_SIZE 64
 #define PAGE_SIZE 4096
@@ -107,13 +117,13 @@ static void *llc_worker_main(void *arg) {
 
 static long measure_l1(void *target) {
     *(volatile uint64_t *)target;
-    return time_memory_load(target);
+    return TIME_LOAD(target);
 }
 
 static long measure_l2(void *target, char *l1_evict_buf) {
     *(volatile uint64_t *)target;
     touch_lines(l1_evict_buf, L1_EVICT_SIZE);
-    return time_memory_load(target);
+    return TIME_LOAD(target);
 }
 
 static long measure_llc(void *target, llc_worker_t *worker) {
@@ -121,12 +131,12 @@ static long measure_llc(void *target, llc_worker_t *worker) {
     worker->target = target;
     sem_post(&worker->request);
     sem_wait(&worker->done);
-    return time_memory_load(target);
+    return TIME_LOAD(target);
 }
 
 static long measure_ram(void *target) {
     flush_cache_line(target);
-    return time_memory_load(target);
+    return TIME_LOAD(target);
 }
 
 int main(int argc, char **argv) {

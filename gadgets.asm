@@ -1,5 +1,6 @@
+section .note.GNU-stack noalloc noexec nowrite progbits
 section .text
-    global add, spec_ret_gadget, spec_ret_gadget_burst, spec_ret_store_gadget, spec_read_gadget, time_memory_load
+    global add, spec_ret_gadget, spec_ret_gadget_burst, spec_ret_store_gadget, spec_read_gadget, time_memory_load, time_memory_load_rdpru, time_memory_load_rdpru_aperf
 
 add:
     mov rax, rdi
@@ -91,5 +92,33 @@ time_memory_load:
     mov rcx, [rdi]
     lfence
     rdtsc
+    sub rax, rsi
+    ret
+
+; long time_memory_load_rdpru(void *ptr)
+; AMD Zen 2+ only. Uses RDPRU (ECX=0 -> MPERF) to count actual core cycles
+; rather than the fixed reference frequency used by RDTSC. More accurate
+; under frequency scaling / turbo.
+time_memory_load_rdpru:
+    lfence
+    xor ecx, ecx        ; ECX=0 selects MPERF (max frequency clock)
+    db 0x0F, 0x01, 0xFD ; rdpru — raw encoding for older NASM versions
+    mov rsi, rax
+    mov r8, [rdi]       ; load from target (r8 to avoid clobbering rdi)
+    lfence
+    xor ecx, ecx
+    db 0x0F, 0x01, 0xFD ; rdpru
+    sub rax, rsi
+    ret
+
+time_memory_load_rdpru_aperf:
+    lfence
+    mov ecx, 1          ; ECX=1 selects APERF (actual performance frequency clock)
+    db 0x0F, 0x01, 0xFD ; rdpru
+    mov rsi, rax
+    mov r8, [rdi]       ; load from target (r8 to avoid clobbering rdi)
+    lfence
+    mov ecx, 1
+    db 0x0F, 0x01, 0xFD ; rdpru
     sub rax, rsi
     ret

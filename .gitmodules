@@ -1,3 +1,3 @@
 [submodule "PTEditor"]
-	path = PTEditor
+	path = spectre-rsb/PTEditor
 	url = git@github.com:awitten1/PTEditor.git

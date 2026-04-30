@@ -28,6 +28,9 @@
 #ifndef NUM_PAGES
 #define NUM_PAGES 256
 #endif
+#ifndef TRAINING_ITERS
+#define TRAINING_ITERS 100
+#endif
 
 static volatile size_t array_size = ARRAY_SIZE;
 static unsigned char public_array[ARRAY_SIZE];
@@ -117,7 +120,7 @@ static void setup(void) {
 static void train_then_attack(size_t malicious_x, unsigned int attempt) {
     size_t training_x = attempt % ARRAY_SIZE;
     int training_iters = rand() % 1000;
-    for (volatile int j = training_iters; j >= 0; --j) {
+    for (volatile int j = TRAINING_ITERS; j >= 0; --j) {
         size_t x = (j == 0) ? malicious_x : training_x;
         victim(x);
     }

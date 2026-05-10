@@ -481,11 +481,12 @@ static void run_branch_secret_experiment(int num_trials, int train_iters, int cp
     munmap(victim, victim_size);
 }
 
-static volatile unsigned char target_byte_storage = 0;
+#define BENCH_TARGET_ARRAY_SIZE 256
+__attribute__((aligned(64))) static unsigned char bench_target_array[BENCH_TARGET_ARRAY_SIZE];
 
-static int run_bench_byte(unsigned char target_value, int num_trials, int threshold, int cpu,
-                          int flush_target) {
-    target_byte_storage = target_value;
+static int run_bench_byte(int num_trials, int threshold, int cpu, int flush_target) {
+    specexp_init_target_array(bench_target_array, BENCH_TARGET_ARRAY_SIZE, 0xdeadbeef);
+    srand((unsigned int)time(NULL));
     void *probe_array = specexp_alloc_probe_buf(SPECEXP_NUM_PAGES);
     memset(probe_array, 0, (size_t)SPECEXP_NUM_PAGES * SPECEXP_PAGE_SIZE);
 
@@ -497,20 +498,25 @@ static int run_bench_byte(unsigned char target_value, int num_trials, int thresh
     unsigned int lcg_state = 1;
     const char *variant = flush_target ? "rsb-flush" : "rsb";
 
-    fprintf(stderr, "%s bench: target=0x%02x trials=%d threshold=%d cpu=%d\n",
-            variant, target_value, num_trials, threshold, sched_getcpu());
-    printf("variant,trial,outcome,leaked_value\n");
+    fprintf(stderr, "%s bench: trials=%d threshold=%d cpu=%d\n",
+            variant, num_trials, threshold, sched_getcpu());
+    printf("variant,trial,target_value,leaked_value,outcome\n");
 
     for (int t = 0; t < num_trials; ++t) {
+        int idx = rand() % BENCH_TARGET_ARRAY_SIZE;
+        unsigned char target_value = bench_target_array[idx];
+        void *target_addr = (void *)&bench_target_array[idx];
+
         specexp_flush_buffer(probe_array, (size_t)SPECEXP_NUM_PAGES * SPECEXP_PAGE_SIZE);
         if (flush_target) {
-            _mm_clflush((const void *)&target_byte_storage);
+            _mm_clflush(target_addr);
             _mm_lfence();
         }
-        spec_read_gadget((void *)&target_byte_storage, probe_array);
+        spec_read_gadget(target_addr, probe_array);
         int found = specexp_probe_argmin(probe_array, SPECEXP_NUM_PAGES, threshold,
                                          SPECEXP_PROBE_SKIP_LOW, order, &lcg_state);
-        printf("%s,%d,%s,%d\n", variant, t, specexp_outcome(found, (int)target_value), found);
+        printf("%s,%d,%d,%d,%s\n", variant, t, (int)target_value, found,
+               specexp_outcome(found, (int)target_value));
     }
 
     munmap(probe_array, (size_t)SPECEXP_NUM_PAGES * SPECEXP_PAGE_SIZE);
@@ -830,8 +836,8 @@ static experiment_config_t parse_config(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--bench-byte") == 0 && i + 1 < argc) {
-            unsigned long target_value = strtoul(argv[i + 1], NULL, 0);
+        if (strcmp(argv[i], "--bench") == 0 ||
+            strcmp(argv[i], "--bench-byte") == 0) {
             int num_trials = 10000;
             int threshold = 120;
             int cpu = DEFAULT_PRIVATE_CPU;
@@ -847,8 +853,7 @@ int main(int argc, char **argv) {
                     flush_target = 1;
                 }
             }
-            return run_bench_byte((unsigned char)target_value, num_trials, threshold, cpu,
-                                  flush_target);
+            return run_bench_byte(num_trials, threshold, cpu, flush_target);
         }
     }
 

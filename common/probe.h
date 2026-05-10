@@ -133,6 +133,14 @@ static inline void specexp_pin_cpu(int cpu) {
     }
 }
 
+static inline void specexp_init_target_array(unsigned char *arr, int n, unsigned int seed) {
+    unsigned int state = seed ? seed : 0xdeadbeef;
+    for (int i = 0; i < n; ++i) {
+        state = specexp_lcg_next(state);
+        arr[i] = (unsigned char)(17 + (state >> 8) % (256 - 17));
+    }
+}
+
 static inline const char *specexp_outcome(int found, int target) {
     if (found < 0) {
         return "unknown";

